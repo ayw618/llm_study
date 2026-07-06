@@ -17,25 +17,41 @@ class SimpleTokenizer:
         self.bos_token_id = self.vocab['<BOS>']
         self.eos_token_id = self.vocab['<EOS>']
 
-    def encode(self, text: str, max_len: int = 12) -> torch.Tensor:
+    def encode(self, text: str, max_len: int = 12, verbose: bool = False) -> torch.Tensor:
+        if verbose:
+            print(f"\n=== 编码过程 ===\n输入文本: '{text}'")
         # 根据词汇表vocab获取token编码
         ids = [self.vocab.get(ch, self.pad_token_id) for ch in text[:max_len]]
+        if verbose:
+            print(f"字符转token: {list(text[:max_len])} -> {ids}")
         # 为token序列添加起始token bos 和终止token eos
         ids = [self.bos_token_id] + ids + [self.eos_token_id]
+        if verbose:
+            print(f"添加<BOS>和<EOS>: [{self.bos_token_id}] + {ids[1:-1]} + [{self.eos_token_id}] = {ids}")
 
         # 如果达不到max_len，则补充pad token
         # 如 对于 1+1=? 的token序列对应如下：
         # <BOS>, 1, +, 1, =, ?, <EOS>, <PAD>, <PAD>, <PAD>, <PAD>, <PAD>
         # 21, 1, 10, 1, 12, 15, 22, 20, 20, 20, 20, 20
         if len(ids) < max_len:
-            ids += [self.pad_token_id] * (max_len - len(ids))
+            pad_count = max_len - len(ids)
+            ids += [self.pad_token_id] * pad_count
+            if verbose:
+                print(f"长度不足，补充{pad_count}个<PAD>: {ids}")
         else:
             ids = ids[:max_len]
 
-        # print("token_ids: ",ids)
-        # unsqueeze(0) 的作用非常直接：在索引 0 的位置插入一个大小为 1 的新维度。
-        # 操作前：torch.tensor(ids) 生成的张量形状是 [L]（比如 [12]），它仅仅是一个普通的序列（向量）。
-        # 操作后：.unsqueeze(0) 后，形状变成 [1, L]（比如 [1, 12]），它变成了一个“只有 1 行”的矩阵。
+        if verbose:
+            print(f"最终token序列长度: {len(ids)}")
+            print("token含义:")
+            for i, idx in enumerate(ids):
+                ch = self.inv_vocab.get(idx, '?')
+                special = ""
+                if idx == self.pad_token_id: special = " (PAD)"
+                elif idx == self.bos_token_id: special = " (BOS)"
+                elif idx == self.eos_token_id: special = " (EOS)"
+                print(f"  位置{i}: {idx} -> '{ch}'{special}")
+
         return torch.tensor(ids, dtype=torch.long).unsqueeze(0)  # [1, L]
 
     def decode(self, ids: torch.Tensor) -> str:
@@ -50,15 +66,58 @@ def rotate_half(x):
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
 
-def apply_rope(q, k, seq_len, head_dim):
+def apply_rope(q, k, seq_len, head_dim, verbose: bool = False):
+    if verbose:
+        print(f"\n=== RoPE位置编码 ===")
+        print(f"  seq_len = {seq_len}, head_dim = {head_dim}")
+    
     inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2, device=q.device).float() / head_dim))
+    
+    if verbose:
+        print(f"  inv_freq (频率倒数): {inv_freq.tolist()}")
+        print(f"    公式: inv_freq[i] = 1 / 10000^(2i / head_dim)")
+    
     t = torch.arange(seq_len, device=q.device).float()
+    
+    if verbose:
+        print(f"  t (位置索引): {t.tolist()}")
+    
     freqs = torch.einsum('i,j->ij', t, inv_freq)
+    
+    if verbose:
+        print(f"  freqs形状: {freqs.shape}")
+        print(f"  freqs (前3个位置的频率):")
+        for i in range(min(3, seq_len)):
+            print(f"    位置{i}: {freqs[i].tolist()}")
+    
     emb = torch.cat((freqs, freqs), dim=-1)
+    
+    if verbose:
+        print(f"  emb形状: {emb.shape}")
+        print(f"  emb含义: 每个位置的旋转角度，前半和后半相同")
+    
     cos = emb.cos().unsqueeze(0).unsqueeze(1)  # [1, 1, L, head_dim]
     sin = emb.sin().unsqueeze(0).unsqueeze(1)
+    
+    if verbose:
+        print(f"  cos形状: {cos.shape}, sin形状: {sin.shape}")
+        print(f"  cos[0,0,0] (位置0的cos值): {cos[0,0,0].tolist()}")
+        print(f"  sin[0,0,0] (位置0的sin值): {sin[0,0,0].tolist()}")
+        print(f"  cos[0,0,1] (位置1的cos值): {cos[0,0,1].tolist()}")
+        print(f"  sin[0,0,1] (位置1的sin值): {sin[0,0,1].tolist()}")
+    
     q_rot = q * cos + rotate_half(q) * sin
     k_rot = k * cos + rotate_half(k) * sin
+    
+    if verbose:
+        print(f"\n 旋转前后对比 (以第1个头为例):")
+        print(f"  q[0,0,0] (旋转前位置0): {q[0,0,0].tolist()[:4]}...")
+        print(f"  q_rot[0,0,0] (旋转后位置0): {q_rot[0,0,0].tolist()[:4]}...")
+        print(f"  q[0,0,1] (旋转前位置1): {q[0,0,1].tolist()[:4]}...")
+        print(f"  q_rot[0,0,1] (旋转后位置1): {q_rot[0,0,1].tolist()[:4]}...")
+        print(f"\n  旋转公式: q_rot = q * cos + rotate_half(q) * sin")
+        print(f"            rotate_half([x1, x2]) = [-x2, x1]")
+    
     return q_rot, k_rot
 
 # ==================== 3. Transformer 层（含 RoPE 多头注意力） ====================
@@ -75,22 +134,80 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, verbose: bool = False):
         B, L, _ = x.shape
+        
+        if verbose:
+            print(f"\n=== 多头注意力 ===")
+            print(f"  B={B}, L={L}, d_model={self.d_model}, num_heads={self.num_heads}, head_dim={self.head_dim}")
+        
+        # QKV投影
         q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        if verbose:
+            print(f"  Q投影后形状: {q.shape}")
+            print(f"  K投影后形状: {k.shape}")
+            print(f"  V投影后形状: {v.shape}")
+            print(f"  Q[0,0,0] (第1个头，位置0): {q[0,0,0].tolist()}")
+            print(f"  K[0,0,0] (第1个头，位置0): {k[0,0,0].tolist()}")
+            print(f"  V[0,0,0] (第1个头，位置0): {v[0,0,0].tolist()}")
 
-        q, k = apply_rope(q, k, L, self.head_dim)
+        # 应用RoPE位置编码
+        q, k = apply_rope(q, k, L, self.head_dim, verbose=verbose)
+        
+        if verbose:
+            print(f"\n  应用RoPE后:")
+            print(f"  q_rot[0,0,0] (旋转后): {q[0,0,0].tolist()}")
+            print(f"  k_rot[0,0,0] (旋转后): {k[0,0,0].tolist()}")
 
+        # 计算注意力分数
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        
+        if verbose:
+            print(f"\n  注意力分数:")
+            print(f"  attn_scores形状: {attn_scores.shape}")
+            print(f"  attn_scores[0,0] (第1个头的注意力分数矩阵):")
+            for i in range(min(5, L)):
+                row = attn_scores[0,0,i].tolist()
+                print(f"    位置{i} -> {row[:5]}...")
+        
         if mask is not None:
             attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
+        
+        # Softmax归一化
         attn_weights = F.softmax(attn_scores, dim=-1)
-
+        
+        if verbose:
+            print(f"\n  注意力权重(softmax后):")
+            print(f"  attn_weights[0,0] (第1个头):")
+            for i in range(min(5, L)):
+                row = attn_weights[0,0,i].tolist()
+                print(f"    位置{i}注意力: {row[:5]}... (和={sum(row):.4f})")
+        
+        # 加权求和
         attn_out = torch.matmul(attn_weights, v)
+        
+        if verbose:
+            print(f"\n  加权求和后:")
+            print(f"  attn_out形状: {attn_out.shape}")
+            print(f"  attn_out[0,0,0]: {attn_out[0,0,0].tolist()}")
+        
+        # 拼接多头输出
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, self.d_model)
-        return self.o_proj(attn_out)
+        
+        if verbose:
+            print(f"\n  拼接多头后形状: {attn_out.shape}")
+        
+        # 输出投影
+        out = self.o_proj(attn_out)
+        
+        if verbose:
+            print(f"  输出投影后形状: {out.shape}")
+            print(f"  out[0,0]: {out[0,0].tolist()}")
+        
+        return out
 
 class TransformerBlock(nn.Module):
     def __init__(self, d_model, num_heads, d_ff=32):
@@ -104,26 +221,114 @@ class TransformerBlock(nn.Module):
             nn.Linear(d_ff, d_model),
         )
 
-    def forward(self, x, mask=None):
-        x = x + self.attn(self.ln1(x), mask)
-        x = x + self.ffn(self.ln2(x))
+    def forward(self, x, mask=None, verbose: bool = False):
+        if verbose:
+            print(f"\n=== Transformer Block ===")
+            print(f"  输入形状: {x.shape}")
+            print(f"  x[0,0] (位置0输入): {x[0,0].tolist()[:5]}...")
+        
+        # 残差连接1: x = x + attn(ln1(x))
+        x_ln1 = self.ln1(x)
+        
+        if verbose:
+            print(f"\n  ln1(x)[0,0] (层归一化后): {x_ln1[0,0].tolist()[:5]}...")
+        
+        attn_out = self.attn(x_ln1, mask, verbose=verbose)
+        
+        if verbose:
+            print(f"\n  attn_out[0,0] (注意力输出): {attn_out[0,0].tolist()[:5]}...")
+        
+        x = x + attn_out
+        
+        if verbose:
+            print(f"\n  残差连接后 x[0,0]: {x[0,0].tolist()[:5]}...")
+            print(f"  残差公式: x = x + attn(ln1(x))")
+        
+        # 残差连接2: x = x + ffn(ln2(x))
+        x_ln2 = self.ln2(x)
+        
+        if verbose:
+            print(f"\n  ln2(x)[0,0] (层归一化后): {x_ln2[0,0].tolist()[:5]}...")
+        
+        ffn_out = self.ffn(x_ln2)
+        
+        if verbose:
+            print(f"\n  ffn_out[0,0] (前馈网络输出): {ffn_out[0,0].tolist()[:5]}...")
+        
+        x = x + ffn_out
+        
+        if verbose:
+            print(f"\n  残差连接后 x[0,0]: {x[0,0].tolist()[:5]}...")
+            print(f"  残差公式: x = x + ffn(ln2(x))")
+        
         return x
 
 class MiniTransformer(nn.Module):
     def __init__(self, vocab_size, pad_token_id, d_model=16, num_heads=2, num_layers=2):
         super().__init__()
         self.pad_token_id = pad_token_id
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_layers = num_layers
         self.embed = nn.Embedding(vocab_size, d_model)
         self.layers = nn.ModuleList([TransformerBlock(d_model, num_heads) for _ in range(num_layers)])
         self.ln_final = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size)
+        self.tokenizer_inv = {
+            0: '0', 1: '1', 2: '2', 3: '3', 4: '4', 5: '5', 6: '6', 7: '7', 8: '8', 9: '9',
+            10: '+', 11: '-', 12: '=', 13: '<', 14: '>', 15: '?', 16: '(', 17: ')', 18: ' ', 19: '\n',
+            20: '<PAD>', 21: '<BOS>', 22: '<EOS>'
+        }
 
-    def forward(self, tokens, mask=None):
+    def forward(self, tokens, mask=None, verbose: bool = False):
+        if verbose:
+            print(f"\n=== MiniTransformer 前向传播 ===\n输入tokens形状: {tokens.shape}, 值: {tokens[0].tolist()}")
+        
         x = self.embed(tokens)  # [B, L, d_model]
-        for layer in self.layers:
-            x = layer(x, mask)
+        if verbose:
+            print(f"\n--- 嵌入层 ---")
+            print(f"嵌入层输出形状: {x.shape}")
+            print(f"嵌入层输出示例(前3个token的完整向量):")
+            for i in range(min(3, x.size(1))):
+                ch = self.tokenizer_inv.get(tokens[0][i].item(), '?') if hasattr(self, 'tokenizer_inv') else '?'
+                print(f"  token[{i}] = {tokens[0][i].item()} ('{ch}'): {x[0, i].tolist()}")
+        
+        for layer_idx, layer in enumerate(self.layers):
+            if verbose:
+                print(f"\n--- Transformer Block {layer_idx} ---")
+            x = layer(x, mask, verbose=verbose)
+            if verbose:
+                print(f"\nTransformer Block {layer_idx} 输出形状: {x.shape}")
+                print(f"  x[0,0] (位置0输出): {x[0,0].tolist()[:5]}...")
+        
+        if verbose:
+            print(f"\n--- 最终层归一化 ---")
         x = self.ln_final(x)
+        
+        if verbose:
+            print(f"ln_final输出形状: {x.shape}")
+            print(f"x[0,0]: {x[0,0].tolist()[:5]}...")
+        
+        if verbose:
+            print(f"\n--- 语言模型头(lm_head) ---")
         logits = self.lm_head(x)
+        
+        if verbose:
+            print(f"语言模型头输出形状: {logits.shape}")
+            print(f"logits含义说明:")
+            print(f"  - 第一维度: batch_size = {logits.size(0)}")
+            print(f"  - 第二维度: 序列长度 = {logits.size(1)}")
+            print(f"  - 第三维度: vocab_size = {logits.size(2)}")
+            print(f"\n最后一个位置的logits(全部23个词汇):")
+            last_logits = logits[0, -1, :]
+            for i in range(logits.size(2)):
+                ch = self.tokenizer_inv.get(i, '?') if hasattr(self, 'tokenizer_inv') else '?'
+                special = ""
+                if i == 20: special = " (PAD)"
+                elif i == 21: special = " (BOS)"
+                elif i == 22: special = " (EOS)"
+                print(f"  词汇{i} -> '{ch}'{special}: {last_logits[i].item():.4f}")
+        
         return logits
 
     def get_log_probs(self, tokens: torch.Tensor):
@@ -163,37 +368,78 @@ def generate_response(
     temperature: float = 1.0,      # 新增：控制随机性
     do_sample: bool = True,        # 新增：是否采样
     top_p: float = 0.9,            # 新增：核采样
+    verbose: bool = False,
 ):
     model.eval()
-    input_ids = tokenizer.encode(prompt, max_len=12)  # [1, L]
+    input_ids = tokenizer.encode(prompt, max_len=12, verbose=verbose)  # [1, L]
     generated = input_ids.squeeze(0).tolist()
 
-    for _ in range(max_new_tokens):
+    if verbose:
+        print(f"\n=== 生成响应 ===\n初始prompt: '{prompt}'")
+        print(f"初始generated序列: {generated}")
+
+    for step in range(max_new_tokens):
         # 使用完整的生成序列（去掉截断，保留全部上下文）
         tokens = torch.tensor([generated], device=next(model.parameters()).device)
-        logits = model(tokens)  # [1, seq_len, vocab]
+        
+        if verbose:
+            print(f"\n--- 生成第{step+1}个token ---")
+            print(f"输入tokens: {tokens[0].tolist()}")
+        
+        logits = model(tokens, verbose=verbose)  # [1, seq_len, vocab]
+        
         next_token_logits = logits[0, -1, :] / temperature  # 温度缩放
+        
+        if verbose:
+            print(f"\n下一步token预测:")
+            print(f"  温度缩放前logits最大值: {logits[0, -1, :].max().item():.4f}")
+            print(f"  温度缩放后logits最大值: {next_token_logits.max().item():.4f}")
+            print(f"  预测概率最高的3个token:")
+            top3 = torch.topk(next_token_logits, 3)
+            for i in range(3):
+                idx = top3.indices[i].item()
+                prob = F.softmax(next_token_logits, dim=-1)[idx].item()
+                ch = tokenizer.inv_vocab.get(idx, '?')
+                special = ""
+                if idx == tokenizer.pad_token_id: special = " (PAD)"
+                elif idx == tokenizer.bos_token_id: special = " (BOS)"
+                elif idx == tokenizer.eos_token_id: special = " (EOS)"
+                print(f"    位置{i+1}: token={idx} -> '{ch}'{special}, 概率={prob*100:.2f}%")
 
         if do_sample:
-            # 核采样（可选）
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
                 cumsum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
                 sorted_logits[cumsum_probs > top_p] = -float('Inf')
                 probs = F.softmax(sorted_logits, dim=-1)
-                # 注意：这里需要对 sorted_indices 映射，但为简化，我们直接用原始分布
-                # 更简单：直接对调整后的 logits 采样（但会丢失 top_p 效果）
-                # 这里我们直接用原始 logits 采样，但保持代码简洁
-                probs = F.softmax(next_token_logits, dim=-1)
+                next_token = sorted_indices[torch.multinomial(probs, 1).item()].item()
             else:
                 probs = F.softmax(next_token_logits, dim=-1)
-            next_token = torch.multinomial(probs, 1).item()
+                next_token = torch.multinomial(probs, 1).item()
         else:
             next_token = torch.argmax(next_token_logits).item()
 
+        if verbose:
+            ch = tokenizer.inv_vocab.get(next_token, '?')
+            special = ""
+            if next_token == tokenizer.pad_token_id: special = " (PAD)"
+            elif next_token == tokenizer.bos_token_id: special = " (BOS)"
+            elif next_token == tokenizer.eos_token_id: special = " (EOS)"
+            print(f"  选择的token: {next_token} -> '{ch}'{special}")
+
         if next_token == tokenizer.eos_token_id:
+            if verbose:
+                print("  遇到<EOS>，停止生成")
             break
         generated.append(next_token)
+        
+        if verbose:
+            print(f"  当前generated序列: {generated}")
+
+    if verbose:
+        print(f"\n最终生成结果: {generated}")
+        decoded = tokenizer.decode(torch.tensor(generated))
+        print(f"解码结果: '{decoded}'")
 
     return torch.tensor(generated, device=next(model.parameters()).device).unsqueeze(0)
 
@@ -278,20 +524,41 @@ class GRPOTrainer:
         for p in self.old_policy.parameters():
             p.requires_grad = False
 
-    def train_step(self, prompts, ground_truths):
+    def train_step(self, prompts, ground_truths, verbose: bool = False):
         B = len(prompts)
         G = self.config.group_size
         device = next(self.policy.parameters()).device
 
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"=== GRPO 训练步骤 ===")
+            print(f"  batch_size (B) = {B}")
+            print(f"  group_size (G) = {G}")
+            print(f"  总样本数 = {B * G}")
+            print(f"  prompts = {prompts}")
+            print(f"  ground_truths = {ground_truths}")
+
         # <<< 1. 将当前策略复制给旧策略（作为采样策略）
+        if verbose:
+            print(f"\n--- 步骤1: 同步old_policy ---")
+            print(f"  将当前policy参数复制到old_policy")
         self.old_policy.load_state_dict(self.policy.state_dict())
 
         # <<< 2. Rollout：使用 old_policy 采样
+        if verbose:
+            print(f"\n--- 步骤2: Rollout采样 ---")
+            print(f"  使用old_policy为每个prompt生成{G}个响应")
+        
         all_responses = []
-        for prompt in prompts:
-            for _ in range(G):
-                resp = generate_response(model=self.old_policy, tokenizer=self.tokenizer, prompt=prompt)  # 使用 old_policy
+        for prompt_idx, prompt in enumerate(prompts):
+            if verbose:
+                print(f"\n  处理prompt[{prompt_idx}]: '{prompt}'")
+            for g in range(G):
+                resp = generate_response(model=self.old_policy, tokenizer=self.tokenizer, prompt=prompt, verbose=verbose and g==0)  # 只打印第一个采样的详细信息
                 all_responses.append(resp)
+                if verbose:
+                    decoded = self.tokenizer.decode(resp.squeeze(0))
+                    print(f"    采样{g+1}: {resp[0].tolist()} -> '{decoded}'")
 
         # 填充到相同长度
         max_len = max(r.size(1) for r in all_responses)
@@ -305,49 +572,127 @@ class GRPOTrainer:
                 r_pad = r
             padded_responses.append(r_pad)
         responses = torch.cat(padded_responses, dim=0)  # [B*G, max_len]
+        
+        if verbose:
+            print(f"\n  所有响应填充后形状: {responses.shape}")
+            print(f"  响应示例(前3个):")
+            for i in range(min(3, responses.size(0))):
+                decoded = self.tokenizer.decode(responses[i])
+                print(f"    [{i}]: {responses[i].tolist()} -> '{decoded}'")
 
         # <<< 3. 计算 old_log_probs（来自 old_policy，无梯度）
+        if verbose:
+            print(f"\n--- 步骤3: 计算old_log_probs ---")
+            print(f"  使用old_policy计算响应的log概率（无梯度）")
         with torch.no_grad():
             old_log_probs = self.old_policy.get_log_probs(responses)  # 使用 old_policy
+        
+        if verbose:
+            print(f"  old_log_probs形状: {old_log_probs.shape}")
+            print(f"  old_log_probs值: {old_log_probs.tolist()}")
 
         # 4. 奖励
-        rewards = math_reward_fn(responses, self.tokenizer, ground_truths, G)
+        if verbose:
+            print(f"\n--- 步骤4: 计算奖励 ---")
+        rewards = math_reward_fn(responses, self.tokenizer, ground_truths, G, verbose=verbose)
         rewards = rewards.view(B, G)
-        print("rewards:\n",rewards)
+        
+        if verbose:
+            print(f"  rewards形状: {rewards.shape}")
+            print(f"  rewards值:\n{rewards}")
+            print(f"\n  奖励含义:")
+            for i in range(B):
+                print(f"    问题{i} (\"{prompts[i]}\"): 奖励分布 = {rewards[i].tolist()}, 标准答案 = \"{ground_truths[i]}\"")
+
         # 5. 优势
+        if verbose:
+            print(f"\n--- 步骤5: 计算优势(GRPO核心) ---")
+            print(f"  组内归一化优势 = (奖励 - 组内均值) / (组内标准差 + 1e-8)")
+        
         mean_r = rewards.mean(dim=1, keepdim=True) # 形状 [B, 1]（每行的平均值）。
         std_r = rewards.std(dim=1, keepdim=True) # 形状 [B, 1]（每行的标准差）。
         advantages = (rewards - mean_r) / (std_r + 1e-8) # 形状 [B, G]。通过组内归一化（减去平均值，除以标准差）计算出的优势值。
         advantages_flat = advantages.view(-1) # 将 advantages 展平为形状 [B * G] 的一维张量
 
+        if verbose:
+            print(f"  mean_r (组内均值):\n{mean_r}")
+            print(f"  std_r (组内标准差):\n{std_r}")
+            print(f"  advantages (组内归一化优势):\n{advantages}")
+            print(f"  advantages_flat: {advantages_flat.tolist()}")
+            print(f"\n  优势含义:")
+            print(f"    正值: 该响应比同组平均水平好")
+            print(f"    负值: 该响应比同组平均水平差")
+            print(f"    零: 该响应等于同组平均水平")
+
         # 6. 参考策略 log probs（只需计算一次，ref 冻结）
+        if verbose:
+            print(f"\n--- 步骤6: 计算参考策略log_probs ---")
+            print(f"  使用ref策略计算响应的log概率（无梯度）")
         with torch.no_grad():
             log_probs_ref = self.ref.get_log_probs(responses)  # [B*G]
+        
+        if verbose:
+            print(f"  log_probs_ref形状: {log_probs_ref.shape}")
+            print(f"  log_probs_ref值: {log_probs_ref.tolist()}")
 
         # <<< 7. 对同一批数据进行多次梯度更新（PPO epochs）
+        if verbose:
+            print(f"\n--- 步骤7: PPO梯度更新 ({self.config.ppo_epochs} epochs) ---")
+            print(f"  EPS (剪裁参数) = {0.2}")
+            print(f"  BETA (KL惩罚系数) = {0.0001}")
+        
         EPS = 0.2
         BETA = 0.0001
-        for _ in range(self.config.ppo_epochs):
+        for epoch in range(self.config.ppo_epochs):
+            if verbose:
+                print(f"\n  === Epoch {epoch+1}/{self.config.ppo_epochs} ===")
+            
             # 每次更新后重新计算当前策略的 log 概率
             log_probs_theta = self.policy.get_log_probs(responses)  # 有梯度
+            
+            if verbose:
+                print(f"    log_probs_theta (当前策略): {log_probs_theta.tolist()}")
 
             ratio = torch.exp(log_probs_theta - old_log_probs)
             clipped_ratio = torch.clamp(ratio, 1.0 - EPS, 1.0 + EPS)
+            
+            if verbose:
+                print(f"    ratio (概率比值): {ratio.tolist()}")
+                print(f"    clipped_ratio (剪裁后): {clipped_ratio.tolist()}")
+
             surr1 = ratio * advantages_flat # 逐元素乘法
             surr2 = clipped_ratio * advantages_flat
             surrogate_loss = torch.min(surr1, surr2)
+            
+            if verbose:
+                print(f"    surr1 = ratio * advantages: {surr1.tolist()}")
+                print(f"    surr2 = clipped_ratio * advantages: {surr2.tolist()}")
+                print(f"    surrogate_loss (min(surr1, surr2)): {surrogate_loss.tolist()}")
 
             log_diff = log_probs_ref - log_probs_theta
             kl_div = torch.exp(log_diff) - log_diff - 1
             kl_loss = BETA * kl_div.mean()
 
+            if verbose:
+                print(f"    log_diff = log_probs_ref - log_probs_theta: {log_diff.tolist()}")
+                print(f"    kl_div: {kl_div.tolist()}")
+                print(f"    kl_loss = {BETA} * kl_div.mean() = {kl_loss.item():.6f}")
+
             loss = -surrogate_loss.mean() + kl_loss
+            
+            if verbose:
+                print(f"    loss = -surrogate_loss.mean() + kl_loss")
+                print(f"         = -{surrogate_loss.mean().item():.6f} + {kl_loss.item():.6f}")
+                print(f"         = {loss.item():.6f}")
 
             # 反向传播
             self.optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
             self.optimizer.step()
+
+            if verbose:
+                print(f"    梯度更新完成")
 
         # 返回监控指标（取最后一次的 ratio 和 loss）
         return {
@@ -383,6 +728,7 @@ def evaluate_model(model, tokenizer, test_prompts, test_ground_truths, max_new_t
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = SimpleTokenizer()
+    print("词汇表:")
     print(tokenizer.vocab)
     vocab_size = tokenizer.vocab_size
 
@@ -391,36 +737,19 @@ if __name__ == "__main__":
     ref.load_state_dict(policy.state_dict())
 
     class Config:
-        group_size = 8
+        group_size = 3
         lr = 1e-2
-        ppo_epochs = 2   # 对同一批数据重复更新的次数
+        ppo_epochs = 1
     config = Config()
 
     trainer = GRPOTrainer(policy, ref, tokenizer, config)
     
-    # 训练数据
-    # prompts = ["1+1=?", "2+3=?", "3+4=?","4+5=?"]
-    # ground_truths = ["2", "5","7","9"]
-    # 训练数据（用于 RL 训练）
-    train_prompts = ["1+1=?", "2+3=?","3+4=?", "4+5=?"]
-    train_ground_truths = ["2", "5","7", "9"]
+    train_prompts = ["1+1=?"]
+    train_ground_truths = ["2"]
     
-    # 测试数据（从未参与训练，用于评估泛化能力）
-    test_prompts = ["3+4=?", "4+5=?"]
-    test_ground_truths = ["7", "9"]
-    to_test = False
-    # steps_num = 500
-    # for step in range(steps_num):
-    #     metrics = trainer.train_step(prompts, ground_truths)
-    #     print(f"Step {step}: Loss={metrics['loss']:.4f}, KL={metrics['kl_loss']:.4f}, Ratio={metrics['mean_ratio']:.4f}")
-    steps_num = 500
-    eval_interval = 20
-
+    steps_num = 1
+    
     for step in range(steps_num):
-        metrics = trainer.train_step(train_prompts, train_ground_truths)
-        print(f"Step {step}: Loss={metrics['loss']:.4f}, KL={metrics['kl_loss']:.4f}, Ratio={metrics['mean_ratio']:.4f}")
-        if to_test:
-            if (step + 1) % eval_interval == 0:
-                acc = evaluate_model(policy, tokenizer, test_prompts, test_ground_truths)
-                print(f"  >>> Test Accuracy: {acc:.2f}")
-    print("训练完成！")
+        metrics = trainer.train_step(train_prompts, train_ground_truths, verbose=True)
+        print(f"\nStep {step}: Loss={metrics['loss']:.4f}, KL={metrics['kl_loss']:.4f}, Ratio={metrics['mean_ratio']:.4f}")
+    print("\n训练完成！")
