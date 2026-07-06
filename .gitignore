@@ -1,2 +1,6 @@
+# 通用忽略文件
 .*/
 __pycache__/
+
+# Post Training 忽略文件
+post_training/verl/
