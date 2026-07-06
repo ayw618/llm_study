@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import math
 from typing import List
 import copy
+
 # ==================== 1. 分词器（字符级） ====================
 class SimpleTokenizer:
     def __init__(self):
@@ -18,25 +19,13 @@ class SimpleTokenizer:
         self.eos_token_id = self.vocab['<EOS>']
 
     def encode(self, text: str, max_len: int = 12) -> torch.Tensor:
-        # 根据词汇表vocab获取token编码
         ids = [self.vocab.get(ch, self.pad_token_id) for ch in text[:max_len]]
-        # 为token序列添加起始token bos 和终止token eos
         ids = [self.bos_token_id] + ids + [self.eos_token_id]
-
-        # 如果达不到max_len，则补充pad token
-        # 如 对于 1+1=? 的token序列对应如下：
-        # <BOS>, 1, +, 1, =, ?, <EOS>, <PAD>, <PAD>, <PAD>, <PAD>, <PAD>
-        # 21, 1, 10, 1, 12, 15, 22, 20, 20, 20, 20, 20
         if len(ids) < max_len:
             ids += [self.pad_token_id] * (max_len - len(ids))
         else:
             ids = ids[:max_len]
-
-        # print("token_ids: ",ids)
-        # unsqueeze(0) 的作用非常直接：在索引 0 的位置插入一个大小为 1 的新维度。
-        # 操作前：torch.tensor(ids) 生成的张量形状是 [L]（比如 [12]），它仅仅是一个普通的序列（向量）。
-        # 操作后：.unsqueeze(0) 后，形状变成 [1, L]（比如 [1, 12]），它变成了一个“只有 1 行”的矩阵。
-        return torch.tensor(ids, dtype=torch.long).unsqueeze(0)  # [1, L]
+        return torch.tensor(ids, dtype=torch.long).unsqueeze(0)
 
     def decode(self, ids: torch.Tensor) -> str:
         return ''.join([self.inv_vocab.get(int(i), '') for i in ids if int(i) not in [self.pad_token_id, self.bos_token_id, self.eos_token_id]])
@@ -55,13 +44,13 @@ def apply_rope(q, k, seq_len, head_dim):
     t = torch.arange(seq_len, device=q.device).float()
     freqs = torch.einsum('i,j->ij', t, inv_freq)
     emb = torch.cat((freqs, freqs), dim=-1)
-    cos = emb.cos().unsqueeze(0).unsqueeze(1)  # [1, 1, L, head_dim]
+    cos = emb.cos().unsqueeze(0).unsqueeze(1)
     sin = emb.sin().unsqueeze(0).unsqueeze(1)
     q_rot = q * cos + rotate_half(q) * sin
     k_rot = k * cos + rotate_half(k) * sin
     return q_rot, k_rot
 
-# ==================== 3. Transformer 层（含 RoPE 多头注意力） ====================
+# ==================== 3. Transformer 层 ====================
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model, num_heads):
         super().__init__()
@@ -69,7 +58,6 @@ class MultiHeadAttention(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
-
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
@@ -80,14 +68,11 @@ class MultiHeadAttention(nn.Module):
         q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-
         q, k = apply_rope(q, k, L, self.head_dim)
-
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         if mask is not None:
             attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
         attn_weights = F.softmax(attn_scores, dim=-1)
-
         attn_out = torch.matmul(attn_weights, v)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, self.d_model)
         return self.o_proj(attn_out)
@@ -119,7 +104,7 @@ class MiniTransformer(nn.Module):
         self.lm_head = nn.Linear(d_model, vocab_size)
 
     def forward(self, tokens, mask=None):
-        x = self.embed(tokens)  # [B, L, d_model]
+        x = self.embed(tokens)
         for layer in self.layers:
             x = layer(x, mask)
         x = self.ln_final(x)
@@ -127,67 +112,63 @@ class MiniTransformer(nn.Module):
         return logits
 
     def get_log_probs(self, tokens: torch.Tensor):
-        """
-        计算整个序列的自回归平均 log 概率。
-        忽略 PAD token，只对有效 token 计算。
-        """
         B, L = tokens.shape
         if L <= 1:
             return torch.zeros(B, device=tokens.device)
-
-        # 前向传播得到 logits
-        logits = self.forward(tokens)  # [B, L, V]
-        
-        # 自回归：输入 token[:L-1] 预测 token[1:]
-        shift_logits = logits[:, :-1, :]  # [B, L-1, V]
-        shift_tokens = tokens[:, 1:]      # [B, L-1]
-
-        # 计算每个位置预测正确 token 的 log 概率
+        logits = self.forward(tokens)
+        shift_logits = logits[:, :-1, :]
+        shift_tokens = tokens[:, 1:]
         log_probs = F.log_softmax(shift_logits, dim=-1)
-        token_log_probs = log_probs.gather(dim=-1, index=shift_tokens.unsqueeze(-1)).squeeze(-1)  # [B, L-1]
-
-        # 忽略 PAD token (shift_tokens 中 PAD 不参与平均)
+        token_log_probs = log_probs.gather(dim=-1, index=shift_tokens.unsqueeze(-1)).squeeze(-1)
         mask = (shift_tokens != self.pad_token_id).float()
         log_prob_sum = (token_log_probs * mask).sum(dim=-1)
         valid_count = mask.sum(dim=-1).clamp(min=1)
-        avg_log_prob = log_prob_sum / valid_count   # [B]
+        avg_log_prob = log_prob_sum / valid_count
         return avg_log_prob
-    
+
 # ==================== 4. 生成回答（Rollout） ====================
 @torch.no_grad()
 def generate_response(
     model: MiniTransformer,
     tokenizer: SimpleTokenizer,
     prompt: str,
-    max_new_tokens: int = 1,       # 只有一个数字，因此，生成一个数字即可
-    temperature: float = 1.0,      # 新增：控制随机性
-    do_sample: bool = True,        # 新增：是否采样
-    top_p: float = 0.9,            # 新增：核采样
+    max_new_tokens: int = 1,
+    temperature: float = 1.0,
+    do_sample: bool = True,
+    top_p: float = 0.9,
 ):
     model.eval()
-    input_ids = tokenizer.encode(prompt, max_len=12)  # [1, L]
+    input_ids = tokenizer.encode(prompt, max_len=12)
     generated = input_ids.squeeze(0).tolist()
 
     for _ in range(max_new_tokens):
-        # 使用完整的生成序列（去掉截断，保留全部上下文）
         tokens = torch.tensor([generated], device=next(model.parameters()).device)
-        logits = model(tokens)  # [1, seq_len, vocab]
-        next_token_logits = logits[0, -1, :] / temperature  # 温度缩放
+        logits = model(tokens)
+        next_token_logits = logits[0, -1, :] / temperature
 
         if do_sample:
-            # 核采样（可选）
             if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                cumsum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_logits[cumsum_probs > top_p] = -float('Inf')
-                probs = F.softmax(sorted_logits, dim=-1)
-                # 注意：这里需要对 sorted_indices 映射，但为简化，我们直接用原始分布
-                # 更简单：直接对调整后的 logits 采样（但会丢失 top_p 效果）
-                # 这里我们直接用原始 logits 采样，但保持代码简洁
-                probs = F.softmax(next_token_logits, dim=-1)
+                sorted_logits, sorted_indices = torch.sort(next_token_logits / temperature, descending=True)
+                sorted_probs = F.softmax(sorted_logits, dim=-1)
+                cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
+                # 保留累积概率 <= top_p 的部分
+                mask = cumsum_probs <= top_p
+                # 如果第一个 token 的概率已经超过 top_p，则至少保留第一个
+                if not mask.any():
+                    mask[0] = True
+                sorted_probs[~mask] = 0.0
+                # 重新归一化，并添加小 epsilon 防止除零
+                prob_sum = sorted_probs.sum()
+                if prob_sum == 0:
+                    sorted_probs = torch.ones_like(sorted_probs) / len(sorted_probs)  # 退化为均匀分布
+                else:
+                    sorted_probs = sorted_probs / prob_sum
+                # 采样并映射回原始索引
+                sampled_sorted_idx = torch.multinomial(sorted_probs, 1).item()
+                next_token = sorted_indices[sampled_sorted_idx].item()
             else:
-                probs = F.softmax(next_token_logits, dim=-1)
-            next_token = torch.multinomial(probs, 1).item()
+                probs = F.softmax(next_token_logits / temperature, dim=-1)
+                next_token = torch.multinomial(probs, 1).item()
         else:
             next_token = torch.argmax(next_token_logits).item()
 
@@ -205,64 +186,23 @@ def math_reward_fn(
     group_size: int,
     verbose: bool = False
 ) -> torch.Tensor:
-    """
-    规则验证奖励函数：检查每个生成的响应文本是否包含对应的正确答案。
-
-    工作原理：
-        - response_tokens 的总行数 = len(ground_truths) * group_size
-        - 顺序是：先对第1个问题生成 group_size 个响应，再对第2个问题生成 group_size 个响应，依此类推。
-        - 因此，第 i 个响应对应的问题索引为 i // group_size。
-        - 对每个响应，解码为文本，检查对应问题的标准答案是否出现在文本中。
-        - 包含则奖励 1.0，否则 0.0。
-
-    参数:
-        response_tokens: torch.Tensor，形状 [total_samples, seq_len]
-        tokenizer: SimpleTokenizer，用于将 token 序列解码为可读字符串
-        ground_truths: List[str]，每个问题对应的标准答案（与问题顺序一致）
-        group_size: int，每个问题采样的响应数量
-        verbose: bool，是否打印解码文本（便于调试，生产环境可设为 False）
-
-    返回:
-        torch.Tensor: 形状 [total_samples]，每个样本的奖励值（0.0 或 1.0）
-    """
-    # 验证输入维度是否正确
     total_samples = response_tokens.shape[0]
     expected_total = len(ground_truths) * group_size
     if total_samples != expected_total:
-        raise ValueError(
-            f"响应总数 ({total_samples}) 与期望 ({expected_total}) 不匹配。"
-            f"请确保 len(ground_truths) * group_size == response_tokens.shape[0]。"
-        )
+        raise ValueError(f"响应总数 ({total_samples}) 与期望 ({expected_total}) 不匹配。")
 
     rewards = []
-    # 逐条处理响应
     for i, tokens in enumerate(response_tokens):
-        # ---- 1. 确定当前样本对应的问题索引 ----
-        # 因为前 group_size 个是问题0，接下来的 group_size 个是问题1，依此类推
         question_idx = i // group_size
-
-        # ---- 2. 获取该问题的标准答案 ----
         correct_answer = ground_truths[question_idx]
-
-        # ---- 3. 将 token 序列解码为文本（自动忽略 <PAD>、<BOS>、<EOS>） ----
         text = tokenizer.decode(tokens)
-
-
-        # ---- 5. 规则验证：正确答案是否出现在文本中（简单子串匹配） ----
-        reward = 0
-        if correct_answer in text:
-            reward = 1.0   # 答对，正奖励
-        else:
-            reward = 0.0   # 答错，零奖励（不扣分）
+        reward = 1.0 if correct_answer in text else 0.0
         rewards.append(reward)
-        # ---- 4. 调试输出（可选） ----
         if verbose:
             print(f"样本 {i:2d} (问题 {question_idx}, 期望 '{correct_answer}', 奖励 '{reward}'): {text}")
-
-    # 返回奖励张量，设备与输入一致
     return torch.tensor(rewards, device=response_tokens.device)
 
-# ==================== 6. GRPO 训练器 ====================
+# ==================== 6. DAPO 训练器（继承GRPO，增强动态采样与裁剪） ====================
 class GRPOTrainer:
     def __init__(self, policy, ref, tokenizer, config):
         self.policy = policy
@@ -272,68 +212,94 @@ class GRPOTrainer:
         self.optimizer = torch.optim.AdamW(policy.parameters(), lr=config.lr)
         for p in ref.parameters():
             p.requires_grad = False
-
-        # 新增：创建并冻结 old_policy
         self.old_policy = copy.deepcopy(policy)
         for p in self.old_policy.parameters():
             p.requires_grad = False
 
-    def train_step(self, prompts, ground_truths):
+    def train_step(self, prompts, ground_truths, max_retries=5):
         B = len(prompts)
         G = self.config.group_size
         device = next(self.policy.parameters()).device
 
-        # <<< 1. 将当前策略复制给旧策略（作为采样策略）
+        # 复制当前策略作为旧策略（用于采样）
         self.old_policy.load_state_dict(self.policy.state_dict())
 
-        # <<< 2. Rollout：使用 old_policy 采样
+        # ---------- 初始化采样 ----------
         all_responses = []
         for prompt in prompts:
             for _ in range(G):
-                resp = generate_response(model=self.old_policy, tokenizer=self.tokenizer, prompt=prompt)  # 使用 old_policy
+                resp = generate_response(self.old_policy, self.tokenizer, prompt)
                 all_responses.append(resp)
 
         # 填充到相同长度
-        max_len = max(r.size(1) for r in all_responses)
-        padded_responses = []
-        for r in all_responses:
-            pad_len = max_len - r.size(1)
-            if pad_len > 0:
-                pad = torch.full((1, pad_len), self.tokenizer.pad_token_id, device=device)
-                r_pad = torch.cat([r, pad], dim=1)
-            else:
-                r_pad = r
-            padded_responses.append(r_pad)
-        responses = torch.cat(padded_responses, dim=0)  # [B*G, max_len]
+        def pad_responses(responses_list):
+            max_len = max(r.size(1) for r in responses_list)
+            padded = []
+            for r in responses_list:
+                pad_len = max_len - r.size(1)
+                if pad_len > 0:
+                    pad = torch.full((1, pad_len), self.tokenizer.pad_token_id, device=device)
+                    r_pad = torch.cat([r, pad], dim=1)
+                else:
+                    r_pad = r
+                padded.append(r_pad)
+            return torch.cat(padded, dim=0)
 
-        # <<< 3. 计算 old_log_probs（来自 old_policy，无梯度）
-        with torch.no_grad():
-            old_log_probs = self.old_policy.get_log_probs(responses)  # 使用 old_policy
+        responses = pad_responses(all_responses)
 
-        # 4. 奖励
+        # 计算奖励
         rewards = math_reward_fn(responses, self.tokenizer, ground_truths, G)
         rewards = rewards.view(B, G)
-        print("rewards:\n",rewards)
-        # 5. 优势
-        mean_r = rewards.mean(dim=1, keepdim=True) # 形状 [B, 1]（每行的平均值）。
-        std_r = rewards.std(dim=1, keepdim=True) # 形状 [B, 1]（每行的标准差）。
-        advantages = (rewards - mean_r) / (std_r + 1e-8) # 形状 [B, G]。通过组内归一化（减去平均值，除以标准差）计算出的优势值。
-        advantages_flat = advantages.view(-1) # 将 advantages 展平为形状 [B * G] 的一维张量
 
-        # 6. 参考策略 log probs（只需计算一次，ref 冻结）
+        # ---------- 只对全0组进行重试，最多 max_retries 次 ----------
+        retry_count = 0
+        while retry_count < max_retries:
+            # 找出全0的组（每行所有元素都为0）
+            zero_mask = (rewards == 0).all(dim=1)  # [B]
+            if not zero_mask.any():
+                break  # 没有全0组，退出
+
+            # 对每个全0组重新采样
+            invalid_indices = zero_mask.nonzero(as_tuple=True)[0].tolist()
+            for idx in invalid_indices:
+                prompt = prompts[idx]
+                for g in range(G):
+                    new_resp = generate_response(self.old_policy, self.tokenizer, prompt)
+                    all_responses[idx * G + g] = new_resp
+
+            # 重新填充并计算奖励
+            responses = pad_responses(all_responses)
+            rewards = math_reward_fn(responses, self.tokenizer, ground_truths, G)
+            rewards = rewards.view(B, G)
+
+            # print("rewards:\n",rewards)
+            retry_count += 1
+            # print(f"重试第 {retry_count} 次，全0组索引: {invalid_indices}")
+
+        # 如果重试后仍然存在全0组，保留最后一次的结果（不再重试）
+        # 此时优势计算中全0组的标准差为0，优势为0，不会产生梯度，但至少不会死循环
+
+        # ---------- 后续计算（与原代码一致） ----------
         with torch.no_grad():
-            log_probs_ref = self.ref.get_log_probs(responses)  # [B*G]
+            old_log_probs = self.old_policy.get_log_probs(responses)
 
-        # <<< 7. 对同一批数据进行多次梯度更新（PPO epochs）
-        EPS = 0.2
+        mean_r = rewards.mean(dim=1, keepdim=True)
+        std_r = rewards.std(dim=1, keepdim=True)
+        advantages = (rewards - mean_r) / (std_r + 1e-8)
+        advantages_flat = advantages.view(-1)
+
+        with torch.no_grad():
+            log_probs_ref = self.ref.get_log_probs(responses)
+
+        EPS_LOW = 0.2
+        EPS_HIGH = 0.28
         BETA = 0.0001
-        for _ in range(self.config.ppo_epochs):
-            # 每次更新后重新计算当前策略的 log 概率
-            log_probs_theta = self.policy.get_log_probs(responses)  # 有梯度
 
+        for _ in range(self.config.ppo_epochs):
+            log_probs_theta = self.policy.get_log_probs(responses)
             ratio = torch.exp(log_probs_theta - old_log_probs)
-            clipped_ratio = torch.clamp(ratio, 1.0 - EPS, 1.0 + EPS)
-            surr1 = ratio * advantages_flat # 逐元素乘法
+            clipped_ratio = torch.clamp(ratio, 1.0 - EPS_LOW, 1.0 + EPS_HIGH)
+            surr1 = ratio * advantages_flat
             surr2 = clipped_ratio * advantages_flat
             surrogate_loss = torch.min(surr1, surr2)
 
@@ -343,84 +309,71 @@ class GRPOTrainer:
 
             loss = -surrogate_loss.mean() + kl_loss
 
-            # 反向传播
             self.optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
             self.optimizer.step()
 
-        # 返回监控指标（取最后一次的 ratio 和 loss）
         return {
             'loss': loss.item(),
             'kl_loss': kl_loss.item(),
             'mean_ratio': ratio.mean().item(),
         }
-
-
+# ==================== 7. 评估函数 ====================
 def evaluate_model(model, tokenizer, test_prompts, test_ground_truths, max_new_tokens=1):
-    """
-    评估模型在测试集上的准确率（贪婪解码）。
-    """
     model.eval()
     correct = 0
     total = len(test_prompts)
     with torch.no_grad():
         for prompt, gt in zip(test_prompts, test_ground_truths):
-            # 使用贪婪解码（不采样）
             resp_tokens = generate_response(
                 model, tokenizer, prompt,
                 max_new_tokens=max_new_tokens,
-                do_sample=False,          # 确定性的
+                do_sample=False,
                 temperature=1.0
             )
-            # 解码并检查答案
             text = tokenizer.decode(resp_tokens.squeeze(0))
             if gt in text:
                 correct += 1
     return correct / total
 
-# ==================== 7. 主程序 ====================
+# ==================== 8. 主程序 ====================
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = SimpleTokenizer()
     print(tokenizer.vocab)
     vocab_size = tokenizer.vocab_size
 
-    policy = MiniTransformer(vocab_size,pad_token_id=tokenizer.pad_token_id, d_model=16, num_heads=2, num_layers=2).to(device)
-    ref = MiniTransformer(vocab_size,pad_token_id=tokenizer.pad_token_id, d_model=16, num_heads=2, num_layers=2).to(device)
+    policy = MiniTransformer(vocab_size, pad_token_id=tokenizer.pad_token_id, d_model=16, num_heads=2, num_layers=2).to(device)
+    ref = MiniTransformer(vocab_size, pad_token_id=tokenizer.pad_token_id, d_model=16, num_heads=2, num_layers=2).to(device)
     ref.load_state_dict(policy.state_dict())
 
     class Config:
-        group_size = 8
-        lr = 1e-2
-        ppo_epochs = 2   # 对同一批数据重复更新的次数
+        group_size = 8          # 每组的rollout数量
+        lr = 1e-3              # 学习率
+        ppo_epochs = 2          # 同一批数据的更新轮数
     config = Config()
 
     trainer = GRPOTrainer(policy, ref, tokenizer, config)
-    
-    # 训练数据
-    # prompts = ["1+1=?", "2+3=?", "3+4=?","4+5=?"]
-    # ground_truths = ["2", "5","7","9"]
-    # 训练数据（用于 RL 训练）
-    train_prompts = ["1+1=?", "2+3=?","3+4=?", "4+5=?"]
-    train_ground_truths = ["2", "5","7", "9"]
-    
-    # 测试数据（从未参与训练，用于评估泛化能力）
-    test_prompts = ["3+4=?", "4+5=?"]
-    test_ground_truths = ["7", "9"]
-    to_test = False
-    # steps_num = 500
-    # for step in range(steps_num):
-    #     metrics = trainer.train_step(prompts, ground_truths)
-    #     print(f"Step {step}: Loss={metrics['loss']:.4f}, KL={metrics['kl_loss']:.4f}, Ratio={metrics['mean_ratio']:.4f}")
+
+    # 训练数据（4个加法题）
+    train_prompts = ["1+1=?", "2+3=?", "3+4=?", "4+5=?"]
+    train_ground_truths = ["2", "5", "7", "9"]
+
+    # 测试数据（用于评估泛化）
+    test_prompts = ["2+4=?", "4+3=?", "1+4=?", "3+1=?"]
+    test_ground_truths = ["6", "7", "5","4"]
+
     steps_num = 500
-    eval_interval = 20
+    eval_interval = 100
+    to_test = False   # 改为True开启评估
 
     for step in range(steps_num):
-        metrics = trainer.train_step(train_prompts, train_ground_truths)
+        metrics = trainer.train_step(prompts=train_prompts, ground_truths=train_ground_truths,max_retries=100)
         print(f"Step {step}: Loss={metrics['loss']:.4f}, KL={metrics['kl_loss']:.4f}, Ratio={metrics['mean_ratio']:.4f}")
-        if to_test:
-            if (step + 1) % eval_interval == 0:
-                acc = evaluate_model(policy, tokenizer, test_prompts, test_ground_truths)
-                print(f"  >>> Test Accuracy: {acc:.2f}")
+
+        if to_test and (step + 1) % eval_interval == 0:
+            acc = evaluate_model(policy, tokenizer, test_prompts, test_ground_truths)
+            print(f"  >>> Test Accuracy: {acc:.2f}")
+
     print("训练完成！")
