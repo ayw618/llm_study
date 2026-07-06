@@ -3,6 +3,7 @@
 
 Windows系统 PowerShell 
 ```powershell
+python -m venv .llm_study_venv
 .llm_study_venv\Scripts\activate
 ```
 ## Post-Training
