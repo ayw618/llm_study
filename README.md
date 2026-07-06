@@ -10,7 +10,22 @@ python -m venv .llm_study_venv
 
 ### GRPO
 文档在 [post_training/grpo/docs/GRPO.md](post_training/grpo/docs/GRPO.md)
+环境配置：
 ```powershell
-cd post_training/grpo
-pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install -r post_training/grpo/requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+运行命令：
+```powershell
+python post_training\grpo\simple_dum_grpo.py
+```
+### DAPO
+暂时没有文档
+环境配置同GRPO
+```powershell
+pip install -r post_training/grpo/requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+运行命令：
+```powershell
+python post_training\dapo\simple_dum_dapo.py
 ```
