@@ -1,5 +1,5 @@
 # LLM 学习仓库
-这是一个用于学习大模型的仓库
+这是一个用于本人学习大模型的仓库
 
 Windows系统 PowerShell 
 ```powershell
