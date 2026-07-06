@@ -154,7 +154,7 @@ class MiniTransformer(nn.Module):
         return avg_log_prob
 # ==================== 4. 生成回答（Rollout） ====================
 @torch.no_grad()  # 装饰器：禁用梯度计算，节省显存并加速推理（因为生成过程无需反向传播）
-def generate_response(model: MiniTransformer, tokenizer: SimpleTokenizer, prompt: str, max_new_tokens=10):
+def generate_response(model: MiniTransformer, tokenizer: SimpleTokenizer, prompt: str, max_new_tokens=2):
     """
     使用给定的 Transformer 模型自回归地生成对 prompt 的回答。
     
@@ -293,18 +293,26 @@ class GRPOTrainer:
         for p in ref.parameters():
             p.requires_grad = False
 
+        # 新增：创建并冻结 old_policy
+        self.old_policy = copy.deepcopy(policy)
+        for p in self.old_policy.parameters():
+            p.requires_grad = False
+
     def train_step(self, prompts, ground_truths):
-        B = len(prompts) # 获取prompt个数（问题个数）
-        G = self.config.group_size # 获取组大小，要求模型对一个问题要获取G个rollout
+        B = len(prompts)
+        G = self.config.group_size
         device = next(self.policy.parameters()).device
 
-        # 1. Rollout
+        # <<< 1. 将当前策略复制给旧策略（作为采样策略）
+        self.old_policy.load_state_dict(self.policy.state_dict())
+
+        # <<< 2. Rollout：使用 old_policy 采样
         all_responses = []
-        # 模型对每个prompt问题要获取G个rollout
         for prompt in prompts:
             for _ in range(G):
-                resp = generate_response(self.policy, self.tokenizer, prompt)
+                resp = generate_response(self.old_policy, self.tokenizer, prompt)  # 使用 old_policy
                 all_responses.append(resp)
+
         # 填充到相同长度
         max_len = max(r.size(1) for r in all_responses)
         padded_responses = []
@@ -318,55 +326,56 @@ class GRPOTrainer:
             padded_responses.append(r_pad)
         responses = torch.cat(padded_responses, dim=0)  # [B*G, max_len]
 
-        # 2. 计算 old_log_probs（使用当前 policy 但 detach）
+        # <<< 3. 计算 old_log_probs（来自 old_policy，无梯度）
         with torch.no_grad():
-            old_log_probs = self.ref.get_log_probs(responses)  # [B*G]
-        
-        # print("responses: \n",responses)
-        # 3. 奖励
-        rewards = math_reward_fn(responses, self.tokenizer, ground_truths, G)
-        rewards = rewards.view(B, G)  # [B, G]
+            old_log_probs = self.old_policy.get_log_probs(responses)  # 使用 old_policy
 
-        # 4. 优势
+        # 4. 奖励
+        rewards = math_reward_fn(responses, self.tokenizer, ground_truths, G)
+        rewards = rewards.view(B, G)
+        print("rewards:\n",rewards)
+        # 5. 优势
         mean_r = rewards.mean(dim=1, keepdim=True)
         std_r = rewards.std(dim=1, keepdim=True)
         advantages = (rewards - mean_r) / (std_r + 1e-8)
         advantages_flat = advantages.view(-1)
 
-        # 5. 当前策略 log probs
-        log_probs_theta = self.policy.get_log_probs(responses)  # [B*G]
-
-        # 6. 参考策略 log probs
+        # 6. 参考策略 log probs（只需计算一次，ref 冻结）
         with torch.no_grad():
             log_probs_ref = self.ref.get_log_probs(responses)  # [B*G]
 
-        print("old_log_probs:\n",old_log_probs)
-        print("log_probs_theta:\n",log_probs_theta)
-        # 7. GRPO 损失
+        # <<< 7. 对同一批数据进行多次梯度更新（PPO epochs）
         EPS = 0.2
         BETA = 0.001
-        ratio = torch.exp(log_probs_theta - old_log_probs)
-        clipped_ratio = torch.clamp(ratio, 1.0 - EPS, 1.0 + EPS)
-        surr1 = ratio * advantages_flat
-        surr2 = clipped_ratio * advantages_flat
-        surrogate_loss = torch.min(surr1, surr2)
-        log_diff = log_probs_ref - log_probs_theta
-        kl_div = torch.exp(log_diff) - log_diff - 1
-        kl_loss = BETA * kl_div.mean()
-        loss = -surrogate_loss.mean() + kl_loss
+        for _ in range(self.config.ppo_epochs):
+            # 每次更新后重新计算当前策略的 log 概率
+            log_probs_theta = self.policy.get_log_probs(responses)  # 有梯度
 
-        # 8. 反向传播
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
-        self.optimizer.step()
+            ratio = torch.exp(log_probs_theta - old_log_probs)
+            clipped_ratio = torch.clamp(ratio, 1.0 - EPS, 1.0 + EPS)
+            surr1 = ratio * advantages_flat
+            surr2 = clipped_ratio * advantages_flat
+            surrogate_loss = torch.min(surr1, surr2)
 
+            log_diff = log_probs_ref - log_probs_theta
+            kl_div = torch.exp(log_diff) - log_diff - 1
+            kl_loss = BETA * kl_div.mean()
+
+            loss = -surrogate_loss.mean() + kl_loss
+
+            # 反向传播
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+            self.optimizer.step()
+
+        # 返回监控指标（取最后一次的 ratio 和 loss）
         return {
             'loss': loss.item(),
             'kl_loss': kl_loss.item(),
             'mean_ratio': ratio.mean().item(),
         }
-
+    
 # ==================== 7. 主程序 ====================
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -379,8 +388,9 @@ if __name__ == "__main__":
     ref.load_state_dict(policy.state_dict())
 
     class Config:
-        group_size = 4
+        group_size = 8
         lr = 1e-3
+        ppo_epochs = 2   # 对同一批数据重复更新的次数
     config = Config()
 
     trainer = GRPOTrainer(policy, ref, tokenizer, config)
