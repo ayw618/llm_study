@@ -19,7 +19,7 @@ pip install -r post_training/grpo/requirements.txt -i https://pypi.tuna.tsinghua
 python post_training\grpo\simple_dum_grpo.py
 ```
 ### DAPO
-暂时没有文档
+文档在 [post_training/dapo/docs/DAPO.md](post_training/dapo/docs/DAPO.md)
 环境配置同GRPO
 ```powershell
 pip install -r post_training/grpo/requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
@@ -28,4 +28,16 @@ pip install -r post_training/grpo/requirements.txt -i https://pypi.tuna.tsinghua
 运行命令：
 ```powershell
 python post_training\dapo\simple_dum_dapo.py
+```
+
+### OPD
+文档在 [post_training/opd/docs/OPD.md](post_training/opd/docs/OPD.md)
+环境配置同GRPO
+```powershell
+pip install -r post_training/grpo/requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+运行命令：
+```powershell
+python post_training\opd\simple_opd.py
 ```

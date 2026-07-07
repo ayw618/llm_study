@@ -111,20 +111,22 @@ class MiniTransformer(nn.Module):
         logits = self.lm_head(x)
         return logits
 
+# ==================== 修改 MiniTransformer.get_log_probs ====================
     def get_log_probs(self, tokens: torch.Tensor):
+        """
+        返回每个 token 的 log 概率（形状 [B, L-1]），用于 token-level 损失。
+        忽略 PAD token（对应位置设为 0，但梯度不参与）。
+        """
         B, L = tokens.shape
         if L <= 1:
-            return torch.zeros(B, device=tokens.device)
-        logits = self.forward(tokens)
-        shift_logits = logits[:, :-1, :]
-        shift_tokens = tokens[:, 1:]
-        log_probs = F.log_softmax(shift_logits, dim=-1)
-        token_log_probs = log_probs.gather(dim=-1, index=shift_tokens.unsqueeze(-1)).squeeze(-1)
-        mask = (shift_tokens != self.pad_token_id).float()
-        log_prob_sum = (token_log_probs * mask).sum(dim=-1)
-        valid_count = mask.sum(dim=-1).clamp(min=1)
-        avg_log_prob = log_prob_sum / valid_count
-        return avg_log_prob
+            return torch.zeros(B, L-1, device=tokens.device)
+        logits = self.forward(tokens)                     # [B, L, V]
+        shift_logits = logits[:, :-1, :]                  # [B, L-1, V]
+        shift_tokens = tokens[:, 1:]                      # [B, L-1]
+        log_probs = F.log_softmax(shift_logits, dim=-1)  # [B, L-1, V]
+        # 提取每个位置预测正确 token 的 log 概率
+        token_log_probs = log_probs.gather(dim=-1, index=shift_tokens.unsqueeze(-1)).squeeze(-1)  # [B, L-1]
+        return token_log_probs  # 不取平均，直接返回每个 token 的 log 概率
 
 # ==================== 4. 生成回答（Rollout） ====================
 @torch.no_grad()
@@ -216,98 +218,96 @@ class GRPOTrainer:
         for p in self.old_policy.parameters():
             p.requires_grad = False
 
-    def train_step(self, prompts, ground_truths, max_retries=5):
+    def train_step(self, prompts, ground_truths, max_retries=100):
         B = len(prompts)
         G = self.config.group_size
         device = next(self.policy.parameters()).device
 
-        # 复制当前策略作为旧策略（用于采样）
         self.old_policy.load_state_dict(self.policy.state_dict())
 
-        # ---------- 初始化采样 ----------
-        all_responses = []
-        for prompt in prompts:
-            for _ in range(G):
-                resp = generate_response(self.old_policy, self.tokenizer, prompt)
-                all_responses.append(resp)
+        # ---------- DAPO 创新点 2: Dynamic Sampling ----------
+        # 论文要求：过滤掉全0或全1的组（即组内奖励标准差为0），
+        # 持续采样直到所有组都有正有负，确保每个组都能提供有效梯度。
+        try_count = 0
+        while try_count < max_retries:
+            try_count += 1
+            all_responses = []
+            for prompt in prompts:
+                for _ in range(G):
+                    resp = generate_response(self.old_policy, self.tokenizer, prompt)
+                    all_responses.append(resp)
 
-        # 填充到相同长度
-        def pad_responses(responses_list):
-            max_len = max(r.size(1) for r in responses_list)
-            padded = []
-            for r in responses_list:
-                pad_len = max_len - r.size(1)
-                if pad_len > 0:
-                    pad = torch.full((1, pad_len), self.tokenizer.pad_token_id, device=device)
-                    r_pad = torch.cat([r, pad], dim=1)
-                else:
-                    r_pad = r
-                padded.append(r_pad)
-            return torch.cat(padded, dim=0)
+            def pad_responses(responses_list):
+                max_len = max(r.size(1) for r in responses_list)
+                padded = []
+                for r in responses_list:
+                    pad_len = max_len - r.size(1)
+                    if pad_len > 0:
+                        pad = torch.full((1, pad_len), self.tokenizer.pad_token_id, device=device)
+                        r_pad = torch.cat([r, pad], dim=1)
+                    else:
+                        r_pad = r
+                    padded.append(r_pad)
+                return torch.cat(padded, dim=0)
 
-        responses = pad_responses(all_responses)
+            responses = pad_responses(all_responses)
+            rewards = math_reward_fn(responses, self.tokenizer, ground_truths, G)
+            rewards = rewards.view(B, G)
 
-        # 计算奖励
-        rewards = math_reward_fn(responses, self.tokenizer, ground_truths, G)
-        rewards = rewards.view(B, G)
+            # 检查组内标准差是否为0（全0或全1）
+            std_r = rewards.std(dim=1)
+            valid_mask = std_r > 1e-8
+            if valid_mask.all():
+                break  # 全部有效，退出循环
 
-        # ---------- 只对全0组进行重试，最多 max_retries 次 ----------
-        retry_count = 0
-        while retry_count < max_retries:
-            # 找出全0的组（每行所有元素都为0）
-            zero_mask = (rewards == 0).all(dim=1)  # [B]
-            if not zero_mask.any():
-                break  # 没有全0组，退出
-
-            # 对每个全0组重新采样
-            invalid_indices = zero_mask.nonzero(as_tuple=True)[0].tolist()
+            # 对无效组重新采样（仅替换这些组）
+            invalid_indices = (~valid_mask).nonzero(as_tuple=True)[0].tolist()
             for idx in invalid_indices:
                 prompt = prompts[idx]
                 for g in range(G):
                     new_resp = generate_response(self.old_policy, self.tokenizer, prompt)
                     all_responses[idx * G + g] = new_resp
+            # 继续循环，重新检查
 
-            # 重新填充并计算奖励
-            responses = pad_responses(all_responses)
-            rewards = math_reward_fn(responses, self.tokenizer, ground_truths, G)
-            rewards = rewards.view(B, G)
-
-            # print("rewards:\n",rewards)
-            retry_count += 1
-            # print(f"重试第 {retry_count} 次，全0组索引: {invalid_indices}")
-
-        # 如果重试后仍然存在全0组，保留最后一次的结果（不再重试）
-        # 此时优势计算中全0组的标准差为0，优势为0，不会产生梯度，但至少不会死循环
-
-        # ---------- 后续计算（与原代码一致） ----------
+        # ---------- 计算 old_log_probs (token-level) ----------
+        # 注意：get_log_probs 返回每个 token 的 log 概率，形状 [B*G, L-1]
         with torch.no_grad():
-            old_log_probs = self.old_policy.get_log_probs(responses)
+            old_log_probs = self.old_policy.get_log_probs(responses)  # [B*G, L-1]
 
+        # ---------- 计算优势 (组内标准化) ----------
         mean_r = rewards.mean(dim=1, keepdim=True)
         std_r = rewards.std(dim=1, keepdim=True)
-        advantages = (rewards - mean_r) / (std_r + 1e-8)
-        advantages_flat = advantages.view(-1)
+        advantages = (rewards - mean_r) / (std_r + 1e-8)  # [B, G]
+        # 将标量优势广播到每个 token（所有 token 共享同一组优势）
+        adv_flat = advantages.view(-1)  # [B*G]
+        adv_expanded = adv_flat.unsqueeze(1).expand(-1, old_log_probs.size(1))  # [B*G, L-1]
 
-        with torch.no_grad():
-            log_probs_ref = self.ref.get_log_probs(responses)
+        # ---------- 参考策略 log probs (token-level) ----------
+        # 在DAPO里没有用，因为DAPO不计算KL Loss
+        # with torch.no_grad():
+        #     log_probs_ref = self.ref.get_log_probs(responses)  # [B*G, L-1]
 
+        # ---------- DAPO 创新点 1: Clip-Higher (非对称裁剪) ----------
+        # 论文设置 ε_low=0.2, ε_high=0.28，提高上界以鼓励探索
         EPS_LOW = 0.2
         EPS_HIGH = 0.28
-        BETA = 0.0001
 
         for _ in range(self.config.ppo_epochs):
-            log_probs_theta = self.policy.get_log_probs(responses)
-            ratio = torch.exp(log_probs_theta - old_log_probs)
+            log_probs_theta = self.policy.get_log_probs(responses)  # [B*G, L-1]
+            ratio = torch.exp(log_probs_theta - old_log_probs)      # [B*G, L-1]
             clipped_ratio = torch.clamp(ratio, 1.0 - EPS_LOW, 1.0 + EPS_HIGH)
-            surr1 = ratio * advantages_flat
-            surr2 = clipped_ratio * advantages_flat
-            surrogate_loss = torch.min(surr1, surr2)
+            surr1 = ratio * adv_expanded
+            surr2 = clipped_ratio * adv_expanded
+            surrogate_loss = torch.min(surr1, surr2)  # [B*G, L-1]
 
-            log_diff = log_probs_ref - log_probs_theta
-            kl_div = torch.exp(log_diff) - log_diff - 1
-            kl_loss = BETA * kl_div.mean()
+            # ---------- DAPO 创新点 3: Token-Level Policy Gradient Loss ----------
+            # 对所有有效 token 取平均，每个 token 贡献相同，避免长样本被稀释
+            shift_tokens = responses[:, 1:]
+            token_mask = (shift_tokens != self.tokenizer.pad_token_id).float()  # [B*G, L-1]
+            loss = - (surrogate_loss * token_mask).sum() / (token_mask.sum() + 1e-8)
 
-            loss = -surrogate_loss.mean() + kl_loss
+            # ---------- DAPO 创新点 4: 移除 KL 散度 ----------
+            # 论文 Section 2.3 明确排除 KL 惩罚，长CoT场景下约束不必要
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -316,9 +316,9 @@ class GRPOTrainer:
 
         return {
             'loss': loss.item(),
-            'kl_loss': kl_loss.item(),
             'mean_ratio': ratio.mean().item(),
         }
+        
 # ==================== 7. 评估函数 ====================
 def evaluate_model(model, tokenizer, test_prompts, test_ground_truths, max_new_tokens=1):
     model.eval()
@@ -364,13 +364,14 @@ if __name__ == "__main__":
     test_prompts = ["2+4=?", "4+3=?", "1+4=?", "3+1=?"]
     test_ground_truths = ["6", "7", "5","4"]
 
-    steps_num = 500
+    steps_num = 100
     eval_interval = 100
     to_test = False   # 改为True开启评估
 
     for step in range(steps_num):
-        metrics = trainer.train_step(prompts=train_prompts, ground_truths=train_ground_truths,max_retries=100)
-        print(f"Step {step}: Loss={metrics['loss']:.4f}, KL={metrics['kl_loss']:.4f}, Ratio={metrics['mean_ratio']:.4f}")
+        metrics = trainer.train_step(prompts=train_prompts, ground_truths=train_ground_truths, max_retries=100)
+        # 修改打印语句，移除 KL
+        print(f"Step {step}: Loss={metrics['loss']:.4f}, Ratio={metrics['mean_ratio']:.4f}")
 
         if to_test and (step + 1) % eval_interval == 0:
             acc = evaluate_model(policy, tokenizer, test_prompts, test_ground_truths)

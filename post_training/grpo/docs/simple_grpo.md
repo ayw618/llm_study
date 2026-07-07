@@ -1,12 +1,12 @@
-...`）。实际上，对于RL，我们*生成*响应 \(o_i\)。假设我们为2个问题生成4个响应。Ro = [B, G, seq_len]。
-    *   *前向传播（评估）*：我们需要旧策略 \(\pi_{old}\)（预计算/冻结）和当前策略 \(\pi_\theta\) 以及参考策略 \(\pi_{ref}\) 的log概率。计算 \(o_i\) 中每个token的log概率，并对序列求和，得到总对数概率 \(\log \pi(o_i|q)\)。形状：[B, G]。
-    *   *奖励*：规则奖励（检查答案）。\(r_{i}\) 形状：[B, G]。
-    *   *优势*：\(mean_r = mean(r, dim=1)\) -> [B, 1]。\(std_r = std(r, dim=1)\)。\(A_i = (r_i - mean_r) / std_r\) -> 形状 [B, G]。
-    *   *比率*：\(ratio = \exp(\log \pi_\theta - \log \pi_{old})\)。形状：[B, G]。
-    *   *裁剪目标*：\(\min(ratio * A, clip(ratio, 1-\epsilon, 1+\epsilon) * A)\)。形状：[B, G]。
-    *   *KL惩罚*：\(kl = \exp(\log \pi_{ref} - \log \pi_\theta) - (\log \pi_{ref} - \log \pi_\theta) - 1\)。形状：[B, G]。
-    *   *最终损失*：\(Loss = -mean(目标 - \beta * kl)\)。标量。
-    *   *反向传播*：梯度计算。更新 \(\theta\)。*矩阵数值*：展示特定token的 \(ratio\) 如何变化（例如，ratio=1.2，裁剪在[0.8, 1.2] => 1.2。如果A为负，则下界）。
+...`）。实际上，对于RL，我们*生成*响应 $o_i$。假设我们为2个问题生成4个响应。Ro = [B, G, seq_len]。
+    *   *前向传播（评估）*：我们需要旧策略 $\pi_{old}$（预计算/冻结）和当前策略 $\pi_\theta$ 以及参考策略 $\pi_{ref}$ 的log概率。计算 $o_i$ 中每个token的log概率，并对序列求和，得到总对数概率 $\log \pi(o_i|q)$。形状：[B, G]。
+    *   *奖励*：规则奖励（检查答案）。$r_{i}$ 形状：[B, G]。
+    *   *优势*：$mean_r = mean(r, dim=1)$ -> [B, 1]。$std_r = std(r, dim=1)$。$A_i = (r_i - mean_r) / std_r$ -> 形状 [B, G]。
+    *   *比率*：$ratio = \exp(\log \pi_\theta - \log \pi_{old})$。形状：[B, G]。
+    *   *裁剪目标*：$\min(ratio * A, clip(ratio, 1-\epsilon, 1+\epsilon) * A)$。形状：[B, G]。
+    *   *KL惩罚*：$kl = \exp(\log \pi_{ref} - \log \pi_\theta) - (\log \pi_{ref} - \log \pi_\theta) - 1$。形状：[B, G]。
+    *   *最终损失*：$Loss = -mean(目标 - \beta * kl)$。标量。
+    *   *反向传播*：梯度计算。更新 $\theta$。*矩阵数值*：展示特定token的 $ratio$ 如何变化（例如，ratio=1.2，裁剪在[0.8, 1.2] => 1.2。如果A为负，则下界）。
 
 5.  **完善代码/伪代码**：
     *   编写清晰的类`GRPOTrainer`。
@@ -22,28 +22,28 @@
 
 ### 1. GRPO 核心原理解析（与 PPO 的区别）
 
-- **PPO (Proximal Policy Optimization)**：需要训练一个 **Critic 模型（价值网络）** 来估计状态价值 \( V(s) \)，用于计算 Advantage（优势），这会消耗大量显存和计算。
-- **GRPO (Group Relative Policy Optimization)**：**弃用 Critic 模型**。对于每个问题 \( q \)，它采样一组输出 \( \{o_1, o_2, ..., o_G\} \)（G 组），通过组内奖励的相对比较（标准化）直接估算 Advantage。
+- **PPO (Proximal Policy Optimization)**：需要训练一个 **Critic 模型（价值网络）** 来估计状态价值 $ V(s) $，用于计算 Advantage（优势），这会消耗大量显存和计算。
+- **GRPO (Group Relative Policy Optimization)**：**弃用 Critic 模型**。对于每个问题 $ q $，它采样一组输出 $ \{o_1, o_2, ..., o_G\} $（G 组），通过组内奖励的相对比较（标准化）直接估算 Advantage。
 - **数学公式**（论文 Eq.1）：
-  \[
+  $$
   \mathcal{J}_{GRPO}(\theta) = \mathbb{E}_{q \sim P(Q), \{o_i\}_{i=1}^G \sim \pi_{\theta_{old}}(O|q)} \left[ \frac{1}{G} \sum_{i=1}^G \left( \min\left( \frac{\pi_\theta(o_i|q)}{\pi_{\theta_{old}}(o_i|q)} A_i, \text{clip}\left(\frac{\pi_\theta(o_i|q)}{\pi_{\theta_{old}}(o_i|q)}, 1-\epsilon, 1+\epsilon \right) A_i \right) - \beta \mathbb{D}_{KL}(\pi_\theta || \pi_{ref}) \right) \right]
-  \]
+  $$
 - **优势计算**（论文 Eq.3）：
-  \[
+  $$
   A_i = \frac{r_i - \text{mean}(\{r_1, r_2, ..., r_G\})}{\text{std}(\{r_1, r_2, ..., r_G\})}
-  \]
+  $$
 
 ---
 
 ### 2. 完整计算流程（从文本到权重更新）
 
 我们假设以下超参数：
-- Batch Size \( B = 2 \)（2 个独立问题）
-- Group Size \( G = 4 \)（每个问题采样 4 个回答）
-- 词汇表大小 \( V = 10 \)
-- 嵌入维度 \( d_{model} = 8 \)
-- 序列最大长度 \( L = 6 \)（方便手算）
-- GRPO clip 范围 \( \epsilon = 0.2 \)，KL 系数 \( \beta = 0.001 \)
+- Batch Size $ B = 2 $（2 个独立问题）
+- Group Size $ G = 4 $（每个问题采样 4 个回答）
+- 词汇表大小 $ V = 10 $
+- 嵌入维度 $ d_{model} = 8 $
+- 序列最大长度 $ L = 6 $（方便手算）
+- GRPO clip 范围 $ \epsilon = 0.2 $，KL 系数 $ \beta = 0.001 $
 
 #### Step 1：用户输入文本 → Token → 输入嵌入 (Input Embedding)
 
@@ -53,54 +53,54 @@
 - Q2 Tokens: `[2, 5, 8, 3]`（长度 4）
 
 **Padding 至 L=6**（假设 0 为 PAD）：
-- 输入矩阵 \( X_{raw} \) 形状 `[B, L]` = `[[1,4,7,3,0,0], [2,5,8,3,0,0]]`
+- 输入矩阵 $ X_{raw} $ 形状 `[B, L]` = `[[1,4,7,3,0,0], [2,5,8,3,0,0]]`
 
-**嵌入层**（权重矩阵 \( W_{emb} \) 形状 `[V, d_model]` = `[10, 8]`）：
-- 查表得到嵌入张量 \( X \) 形状 `[B, L, d_model]` = `[2, 6, 8]`。
+**嵌入层**（权重矩阵 $ W_{emb} $ 形状 `[V, d_model]` = `[10, 8]`）：
+- 查表得到嵌入张量 $ X $ 形状 `[B, L, d_model]` = `[2, 6, 8]`。
 - **数值变化示例**（只看第一行第一列）：
   - Token `1` 对应的嵌入向量为 `[0.1, -0.2, 0.3, ...]`。
 
 #### Step 2：位置编码 (Positional Encoding)
 
 由于 Transformer 没有循环结构，需要注入位置信息（论文使用的 RoPE，此处为简化使用 Sinusoidal 编码）。
-- 位置编码矩阵 \( PE \) 形状 `[L, d_model]` = `[6, 8]`。
-- 计算 \( X_{pos} = X + PE \)（广播相加）。
-- 此时 \( X_{pos} \) 依然形状 `[2, 6, 8]`，但数值带上了位置信息（如第 0 位和第 5 位的数值差异）。
+- 位置编码矩阵 $ PE $ 形状 `[L, d_model]` = `[6, 8]`。
+- 计算 $ X_{pos} = X + PE $（广播相加）。
+- 此时 $ X_{pos} $ 依然形状 `[2, 6, 8]`，但数值带上了位置信息（如第 0 位和第 5 位的数值差异）。
 
 #### Step 3：Transformer 前向传播（注意力 + 前馈网络）
 
 为了简洁，我们只看**单层** Transformer 的核心矩阵运算。
 
 **多头自注意力 (Multi-Head Attention)**：
-假设 2 个头（\( d_k = 4 \)）：
-1. **Q, K, V 投影**（权重矩阵 \( W_Q, W_K, W_V \)，形状 `[8, 8]`）：
-   - \( Q = X_{pos} W_Q \)，形状 `[2, 6, 8]`。
-   - \( K, V \) 同理。
+假设 2 个头（$ d_k = 4 $）：
+1. **Q, K, V 投影**（权重矩阵 $ W_Q, W_K, W_V $，形状 `[8, 8]`）：
+   - $ Q = X_{pos} W_Q $，形状 `[2, 6, 8]`。
+   - $ K, V $ 同理。
 2. **注意力分数计算**：
-   - \( S = Q \cdot K^T / \sqrt{d_k} \)，形状 `[2, 6, 6]`。
-   - **数值示例**：\( S[0, 1, 2] = 0.85 \)（表示第 1 个 token 对第 2 个 token 的关注度）。
-3. **Softmax 得到注意力权重** \( A = \text{Softmax}(S) \)，形状 `[2, 6, 6]`。
-4. **输出** \( Z = A \cdot V \)，形状 `[2, 6, 8]`。
-5. **前馈网络 (FFN)**（两层线性层 \( W_1: 8 \to 32, W_2: 32 \to 8 \)）：
-   - \( H = \text{GELU}(Z W_1) W_2 \)，形状保持 `[2, 6, 8]`。
-   - 经过残差连接与 LayerNorm，最终输出隐状态 \( H_{out} \)。
+   - $ S = Q \cdot K^T / \sqrt{d_k} $，形状 `[2, 6, 6]`。
+   - **数值示例**：$ S[0, 1, 2] = 0.85 $（表示第 1 个 token 对第 2 个 token 的关注度）。
+3. **Softmax 得到注意力权重** $ A = \text{Softmax}(S) $，形状 `[2, 6, 6]`。
+4. **输出** $ Z = A \cdot V $，形状 `[2, 6, 8]`。
+5. **前馈网络 (FFN)**（两层线性层 $ W_1: 8 \to 32, W_2: 32 \to 8 $）：
+   - $ H = \text{GELU}(Z W_1) W_2 $，形状保持 `[2, 6, 8]`。
+   - 经过残差连接与 LayerNorm，最终输出隐状态 $ H_{out} $。
 
 #### Step 4：输出 Logits 与 Rollout（采样生成回答）
 
-**Logits 计算**（LM Head，权重 \( W_{head} \) 形状 `[8, V]`）：
-- \( \text{Logits} = H_{out} \cdot W_{head} \)，形状 `[2, 6, 10]`。
+**Logits 计算**（LM Head，权重 $ W_{head} $ 形状 `[8, V]`）：
+- $ \text{Logits} = H_{out} \cdot W_{head} $，形状 `[2, 6, 10]`。
 - 取最后一个有效 token 的 logits（或自回归生成）。为模拟 Rollout，我们取每个问题的完整生成序列。
 
 **Rollout（采样）**：
-对于每个问题（Batch=2），我们使用当前的策略模型（旧策略 \( \pi_{old} \)）采样 \( G=4 \) 个回答。
+对于每个问题（Batch=2），我们使用当前的策略模型（旧策略 $ \pi_{old} $）采样 $ G=4 $ 个回答。
 - 生成序列长度设为 3（例如 `<think> ... </think><answer> X </answer>`）。
 - 采样得到 4 组输出索引，形状 `[B, G, L_gen]` = `[2, 4, 3]`（L_gen=3）。
 
-#### Step 5：计算旧策略的概率（冻结的 \( \pi_{old} \)）
+#### Step 5：计算旧策略的概率（冻结的 $ \pi_{old} $）
 
 我们需要在采样时保存这 4 组回答的生成概率（用于后续 Importance Sampling）。
 - 计算每个 token 的 log 概率，并求和得到整个序列的总 log 概率。
-- 得到 \( \log \pi_{old}(o_i | q) \) 矩阵，形状 `[B, G]` = `[2, 4]`。
+- 得到 $ \log \pi_{old}(o_i | q) $ 矩阵，形状 `[B, G]` = `[2, 4]`。
 
 **假设的数值矩阵 (Log Probs)**：
 对于 Q1 (Batch 0)：
@@ -113,47 +113,47 @@
 依据论文，使用**规则验证 (Rule-based Reward)**：
 - **准确率奖励**：如果回答包含正确答案（如 Q1 的 `2`）给 1.0，否则 0.0。
 - **格式奖励**：如果包含 `<think>` 和 `<answer>` 标签给 0.1，否则 0.0。
-- 总奖励 \( r = r_{acc} + r_{format} \)。
+- 总奖励 $ r = r_{acc} + r_{format} $。
 
-假设根据规则判定，获得奖励矩阵 \( R \) 形状 `[2, 4]`：
+假设根据规则判定，获得奖励矩阵 $ R $ 形状 `[2, 4]`：
 - Q1 (B0)：`[1.1, 0.0, 1.1, 0.0]`
 - Q2 (B1)：`[0.0, 1.1, 1.1, 0.0]`
 
 #### Step 7：优势计算 (Advantage Calculation)
 
-**公式**：\( A_i = \frac{r_i - \text{mean}(r)}{\text{std}(r)} \)
+**公式**：$ A_i = \frac{r_i - \text{mean}(r)}{\text{std}(r)} $
 
 - **对于 Q1**：mean = 0.55, std ≈ 0.6055（样本标准差）。
-  - \( A_0 = (1.1 - 0.55) / 0.6055 \approx 0.908 \)
-  - \( A_1 = (0.0 - 0.55) / 0.6055 \approx -0.908 \)
-  - \( A_2 = 0.908 \), \( A_3 = -0.908 \)
+  - $ A_0 = (1.1 - 0.55) / 0.6055 \approx 0.908 $
+  - $ A_1 = (0.0 - 0.55) / 0.6055 \approx -0.908 $
+  - $ A_2 = 0.908 $, $ A_3 = -0.908 $
 - **对于 Q2**：mean = 0.55, std ≈ 0.6055。
-  - \( A = [-0.908, 0.908, 0.908, -0.908] \)
+  - $ A = [-0.908, 0.908, 0.908, -0.908] $
 
 #### Step 8：当前策略与参考策略的前向传播
 
-我们需要用**当前训练中的策略** \( \pi_\theta \) 和**冻结的参考策略** \( \pi_{ref} \)（通常是 SFT 后的初始 checkpoint）分别计算相同回答的概率。
+我们需要用**当前训练中的策略** $ \pi_\theta $ 和**冻结的参考策略** $ \pi_{ref} $（通常是 SFT 后的初始 checkpoint）分别计算相同回答的概率。
 
-- **当前策略 Logits**：将采样得到的 `[B, G, L_gen]` 输入模型，得到 \( \log \pi_\theta \)，形状 `[2, 4]`。
+- **当前策略 Logits**：将采样得到的 `[B, G, L_gen]` 输入模型，得到 $ \log \pi_\theta $，形状 `[2, 4]`。
   - 假设经过一次迭代后，概率稍微升高：`log_pi_theta = [[-0.4, -1.3, -0.7, -2.0], [-0.9, -0.8, -1.4, -0.6]]`
-- **参考策略 Logits**：同样计算 \( \log \pi_{ref} \)，形状 `[2, 4]`。
+- **参考策略 Logits**：同样计算 $ \log \pi_{ref} $，形状 `[2, 4]`。
   - 假设：`log_pi_ref = [[-0.6, -1.1, -0.9, -2.2], [-1.1, -1.0, -1.6, -0.8]]`
 
 #### Step 9：GRPO 损失计算（核心矩阵数值变化）
 
 **1. 计算概率比率 (Ratio)**：
-\( ratio = \exp(\log \pi_\theta - \log \pi_{old}) \)
+$ ratio = \exp(\log \pi_\theta - \log \pi_{old}) $
 
 - Q1: `exp([-0.4-(-0.5), -1.3-(-1.2), -0.7-(-0.8), -2.0-(-2.1)])`
    = `exp([0.1, -0.1, 0.1, 0.1])` ≈ `[1.105, 0.905, 1.105, 1.105]`
 - Q2: `exp([0.1, 0.1, 0.1, 0.1])` ≈ `[1.105, 1.105, 1.105, 1.105]`
 
 **2. 裁剪机制 (Clipping)**：
-\( \text{clip\_ratio} = \text{clip}(ratio, 1-\epsilon, 1+\epsilon) \) = `clip(ratio, 0.8, 1.2)`
+$ \text{clip\_ratio} = \text{clip}(ratio, 1-\epsilon, 1+\epsilon) $ = `clip(ratio, 0.8, 1.2)`
 由于 ratio 全部在 0.905 ~ 1.105 之间，裁剪后的值不变（即全部等于原值）。
 
 **3. 计算未经裁剪的 Surrogate 目标**：
-\( obj1 = ratio \times A \)
+$ obj1 = ratio \times A $
 - Q1: `[1.105*0.908, 0.905*(-0.908), 1.105*0.908, 1.105*(-0.908)]`
   ≈ `[1.003, -0.822, 1.003, -1.003]`
 - Q2: `[1.105*(-0.908), 1.105*0.908, 1.105*0.908, 1.105*(-0.908)]`
@@ -161,29 +161,29 @@
 
 **4. 计算裁剪后的目标（用于对比，取最小值）**：
 由于裁剪未生效，`obj2 = obj1`。  
-\( surrogate\_loss = \min(obj1, obj2) \) = 上述值。
+$ surrogate\_loss = \min(obj1, obj2) $ = 上述值。
 
 **5. 计算 KL 散度惩罚（论文 Eq.2）**：
-\( \mathbb{D}_{KL} = \frac{\pi_{ref}}{\pi_\theta} - \log\frac{\pi_{ref}}{\pi_\theta} - 1 = \exp(\log \pi_{ref} - \log \pi_\theta) - (\log \pi_{ref} - \log \pi_\theta) - 1 \)
+$ \mathbb{D}_{KL} = \frac{\pi_{ref}}{\pi_\theta} - \log\frac{\pi_{ref}}{\pi_\theta} - 1 = \exp(\log \pi_{ref} - \log \pi_\theta) - (\log \pi_{ref} - \log \pi_\theta) - 1 $
 
-- Q1 第一项：\( ratio_{ref\_to\_theta} = exp(-0.6 - (-0.4)) = exp(-0.2) = 0.819 \)
-  - \( \log diff = -0.2 \)
-  - \( KL = 0.819 - (-0.2) - 1 = 0.019 \)
+- Q1 第一项：$ ratio_{ref\_to\_theta} = exp(-0.6 - (-0.4)) = exp(-0.2) = 0.819 $
+  - $ \log diff = -0.2 $
+  - $ KL = 0.819 - (-0.2) - 1 = 0.019 $
 - 对所有 8 个样本计算 KL，得到 KL 矩阵 `[2, 4]`。
 
 **6. 最终 Loss**：
-\( Loss = -\text{mean}(surrogate\_loss - \beta \times KL) \)
-- 假设 KL 均值约为 0.02，\( \beta=0.001 \)，则 \( KL \) 项约为 0.00002，极小。
+$ Loss = -\text{mean}(surrogate\_loss - \beta \times KL) $
+- 假设 KL 均值约为 0.02，$ \beta=0.001 $，则 $ KL $ 项约为 0.00002，极小。
 - 总的 Loss ≈ `-(sum(obj1) / 8)`。
 
 #### Step 10：反向传播与权重更新
 
-1. **反向传播**：调用 `Loss.backward()`，计算图中所有参数（\( W_{emb}, W_Q, W_K, W_V, W_1, W_2, W_{head} \)）的梯度 \( \frac{\partial Loss}{\partial W} \)。
+1. **反向传播**：调用 `Loss.backward()`，计算图中所有参数（$ W_{emb}, W_Q, W_K, W_V, W_1, W_2, W_{head} $）的梯度 $ \frac{\partial Loss}{\partial W} $。
    - 例如，某个权重矩阵的梯度值可能为 `[[0.001, -0.002], [0.003, 0.001]]`。
 2. **权重更新**（优化器如 AdamW）：
-   \( W_{new} = W_{old} - lr \times \text{gradient} \)
-   - 假设学习率 \( lr = 1e-6 \)，数值变动极小（如 0.001 变成 0.000999）。
-3. **迭代**：新权重成为下一次采样的 \( \pi_{old} \)，不断迭代，模型思考长度增加，准确率上升。
+   $ W_{new} = W_{old} - lr \times \text{gradient} $
+   - 假设学习率 $ lr = 1e-6 $，数值变动极小（如 0.001 变成 0.000999）。
+3. **迭代**：新权重成为下一次采样的 $ \pi_{old} $，不断迭代，模型思考长度增加，准确率上升。
 
 ---
 
@@ -346,4 +346,4 @@ print("单步训练完成！")
 ### 总结与关键洞察
 1. **无需 Critic**：GRPO 通过组内横向比较（`rewards.std()`）替代了 PPO 需要的庞大价值网络，极大降低了显存占用。
 2. **自进化涌现**：在此机制下，模型为了获得更高奖励，会自发延长 CoT 长度（多 token），因为更长的思考往往会带来更高的正确率，从而正向激励了 `log_probs` 的更新。
-3. **矩阵变化本质**：整个过程就是不断地计算条件概率 \( \log \pi(o_i|q) \)，然后通过组内奖惩（标准化后的 \( A_i \)）来放大高概率 token 的权重（`ratio * A`），抑制低概率 token，通过 KL 约束防止偏离参考模型过远。
+3. **矩阵变化本质**：整个过程就是不断地计算条件概率 $ \log \pi(o_i|q) $，然后通过组内奖惩（标准化后的 $ A_i $）来放大高概率 token 的权重（`ratio * A`），抑制低概率 token，通过 KL 约束防止偏离参考模型过远。
