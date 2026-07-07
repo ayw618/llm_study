@@ -1,5 +1,5 @@
 ## On-Policy Distillation (OPD) 算法详解
-
+[On-Policy-Distillation 链接](https://thinkingmachines.ai/blog/on-policy-distillation/)
 ### 一、OPD的核心思想：RL的"纠错相关性" + SFT的"奖励密度"
 
 On-Policy Distillation（在策略蒸馏）是 Thinking Machines Lab 提出的一种后训练方法。其核心思想非常直观：**让学生模型在自己生成的轨迹（rollout）上学习，但每一步都由一个更强大的教师模型进行细粒度的评分和指导**。
