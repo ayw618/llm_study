@@ -41,3 +41,15 @@ pip install -r post_training/grpo/requirements.txt -i https://pypi.tuna.tsinghua
 ```powershell
 python post_training\opd\simple_opd.py
 ```
+
+### SFT
+文档在 [post_training/sft/docs/SFT.md](post_training/sft/docs/SFT.md)
+环境配置同GRPO
+```powershell
+pip install -r post_training/grpo/requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+运行命令：
+```powershell
+python post_training\sft\simple_sft.py
+```
